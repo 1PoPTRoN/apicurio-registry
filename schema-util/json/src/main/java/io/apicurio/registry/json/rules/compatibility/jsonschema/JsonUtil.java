@@ -17,6 +17,7 @@ import io.apicurio.registry.exception.UnreachableCodeException;
 import io.apicurio.registry.json.rules.json.ParsedJsonSchema;
 import io.apicurio.registry.json.rules.validity.JsonSchemaVersion;
 import io.apicurio.registry.types.RegistryException;
+import org.everit.json.schema.loader.SchemaClient;
 import org.everit.json.schema.loader.SchemaLoader;
 import org.everit.json.schema.loader.internal.ReferenceResolver;
 import org.json.JSONObject;
@@ -40,6 +41,20 @@ public class JsonUtil {
 
     public static final ObjectMapper MAPPER;
 
+    /**
+     * The Registry never resolves schema references over the network or from the local filesystem:
+     * referenced content must be supplied explicitly by the caller via {@code resolvedReferences}.
+     * Every {@code $ref} is therefore pre-registered in the loader's reference lookup table (with a
+     * placeholder when no content is available), which stops the library short of this client. Any
+     * lookup that still reaches here means a reference escaped registration, so it fails closed
+     * rather than issuing an outbound request (SSRF) or opening a local file.
+     */
+    static final SchemaClient DENY_REMOTE_SCHEMA_CLIENT = url -> {
+        throw new RegistryException("Unresolved JSON schema reference '" + url
+                + "'. Referenced schemas must be registered explicitly; the Registry does not "
+                + "fetch remote or local schema resources.");
+    };
+
     static {
         MAPPER = new ObjectMapper();
         MAPPER.registerModule(new JsonOrgModule());
@@ -62,12 +77,7 @@ public class JsonUtil {
 
         var jsonNode = MAPPER.readTree(content);
 
-        var specVersion = detect(jsonNode);
-
-        if (specVersion == UNKNOWN) {
-            // TODO: Make this configurable? Throw an exception?
-            specVersion = DRAFT_7;
-        }
+        var specVersion = detectSpecVersionOrDefault(jsonNode);
 
         var referenceURIs = extractReferencesRecursive(specVersion, null, jsonNode);
 
@@ -99,6 +109,24 @@ public class JsonUtil {
             default:
                 throw new UnreachableCodeException("Unhandled case " + specVersion);
         }
+    }
+
+    private static JsonSchemaVersion detectSpecVersionOrDefault(JsonNode jsonNode) {
+        var specVersion = detect(jsonNode);
+        if (specVersion == UNKNOWN) {
+            // TODO: Make this configurable? Throw an exception?
+            specVersion = DRAFT_7;
+        }
+        return specVersion;
+    }
+
+    /**
+     * Extracts every {@code $ref} URI reachable from the given schema document, resolved against the
+     * enclosing {@code $id} scopes. Shared with the compatibility path so that both parsing entry
+     * points register the exact same set of references with the schema loader.
+     */
+    static Set<URI> extractReferences(JsonNode jsonNode) {
+        return extractReferencesRecursive(detectSpecVersionOrDefault(jsonNode), null, jsonNode);
     }
 
     /**
@@ -138,7 +166,8 @@ public class JsonUtil {
     }
 
     private static ParsedJsonSchema readSchemaEverit(JsonNode jsonNode, Map<String, TypedContent> resolvedReferences, Set<URI> extractedReferences) throws JsonProcessingException {
-        var builder = SchemaLoader.builder().useDefaults(true).draftV7Support();
+        var builder = SchemaLoader.builder().useDefaults(true).draftV7Support()
+                .schemaClient(DENY_REMOTE_SCHEMA_CLIENT);
         for (URI extractedReference : extractedReferences) {
             var resolvedReferenceContent = resolvedReferences.get(extractedReference.toString());
             if (resolvedReferenceContent != null) {
